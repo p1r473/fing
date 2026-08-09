@@ -1,0 +1,238 @@
+#!/bin/bash
+
+NS="fing-combo"
+BR="fing0"
+
+BRMAC="02:ff:00:00:00:02"
+MAINMAC="02:01:00:00:00:fb"
+
+SYN=(0 2 3 4 5 6)
+REAL=(14 21 24 42 66 69)
+
+PORTS=(
+    "fc-belle"
+    "fc-21"
+    "fc-24"
+    "fc-42"
+    "fc-66"
+    "fc-69"
+)
+
+PARENTS=(
+    "eth0.14"
+    "eth0.21"
+    "eth0.24"
+    "eth0.42"
+    "eth0.66"
+    "eth0.69"
+)
+
+MACS=(
+    "02:14:00:00:00:fc"
+    "02:21:00:00:00:fc"
+    "02:24:00:00:00:fc"
+    "02:42:00:00:00:fc"
+    "02:66:00:00:00:fc"
+    "02:69:00:00:00:fc"
+)
+
+wait_interfaces() {
+    for IF in eth0 "${PARENTS[@]}"; do
+        COUNT=0
+
+        while ! ip link show "$IF" >/dev/null 2>&1; do
+            COUNT=$((COUNT + 1))
+
+            if [ "$COUNT" -ge 30 ]; then
+                echo "ERROR: $IF did not appear"
+                return 1
+            fi
+
+            sleep 1
+        done
+    done
+
+    return 0
+}
+
+add_port() {
+    PARENT="$1"
+    IF="$2"
+    MAC="$3"
+
+    ip link add link "$PARENT" name "$IF" type macvlan mode bridge || return 1
+    ip link set "$IF" netns "$NS" || return 1
+
+    ip -n "$NS" link set "$IF" address "$MAC"
+    ip -n "$NS" link set "$IF" master "$BR"
+    ip -n "$NS" link set "$IF" up
+}
+
+make_map() {
+    FILE="$1"
+    NAME="$2"
+    FROM="$3"
+    TO="$4"
+
+    {
+        echo "    map $NAME {"
+        echo "        type ipv4_addr : ipv4_addr"
+        echo "        elements = {"
+
+        for I in $(seq 0 255); do
+            if [ "$I" -eq 255 ]; then
+                echo "            192.168.$FROM.$I : 192.168.$TO.$I"
+            else
+                echo "            192.168.$FROM.$I : 192.168.$TO.$I,"
+            fi
+        done
+
+        echo "        }"
+        echo "    }"
+    } >>"$FILE"
+}
+
+start_net() {
+    wait_interfaces || return 1
+
+    ip netns del "$NS" 2>/dev/null || true
+    ip netns add "$NS" || return 1
+
+    ip -n "$NS" link add "$BR" type bridge || return 1
+    ip -n "$NS" link set lo up
+    ip -n "$NS" link set "$BR" address "$BRMAC"
+    ip -n "$NS" link set "$BR" up
+
+    add_port eth0 fc-main "$MAINMAC" || return 1
+
+    for IDX in "${!PARENTS[@]}"; do
+        add_port \
+            "${PARENTS[$IDX]}" \
+            "${PORTS[$IDX]}" \
+            "${MACS[$IDX]}" || return 1
+    done
+
+    ip -n "$NS" addr add 192.168.1.251/21 dev "$BR"
+    ip -n "$NS" route add default via 192.168.1.1 dev "$BR"
+
+    NFT="/tmp/fing-combo.nft"
+    rm -f "$NFT"
+
+    echo 'table bridge fing_combo {' >"$NFT"
+
+    for IDX in "${!SYN[@]}"; do
+        S="${SYN[$IDX]}"
+        R="${REAL[$IDX]}"
+
+        make_map "$NFT" "s${S}_to_${R}" "$S" "$R"
+        make_map "$NFT" "r${R}_to_s${S}" "$R" "$S"
+    done
+
+    cat >>"$NFT" <<'NFT'
+    chain prerouting {
+        type filter hook prerouting priority -300; policy accept;
+
+        iifname "fc-main" arp daddr ether 02:01:00:00:00:fb \
+            arp daddr ether set 02:ff:00:00:00:02 counter
+
+        iifname "fc-main" ether daddr 02:01:00:00:00:fb \
+            ether daddr set 02:ff:00:00:00:02 counter
+NFT
+
+    for IDX in "${!SYN[@]}"; do
+        S="${SYN[$IDX]}"
+        R="${REAL[$IDX]}"
+        IF="${PORTS[$IDX]}"
+        MAC="${MACS[$IDX]}"
+
+        cat >>"$NFT" <<NFT
+        iifname "$IF" arp saddr ip 192.168.$R.0/24 \
+            arp saddr ip set arp saddr ip map @r${R}_to_s${S} counter
+
+        iifname "$IF" arp daddr ip 192.168.$R.252 \
+            arp daddr ip set 192.168.1.251 counter
+
+        iifname "$IF" arp daddr ether $MAC \
+            arp daddr ether set $BRMAC counter
+
+        iifname "$IF" ether daddr $MAC \
+            ether daddr set $BRMAC counter
+
+        iifname "$IF" ip saddr 192.168.$R.0/24 \
+            ip saddr set ip saddr map @r${R}_to_s${S} counter
+
+        iifname "$IF" ip daddr 192.168.$R.252 \
+            ip daddr set 192.168.1.251 counter
+NFT
+    done
+
+    cat >>"$NFT" <<'NFT'
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain postrouting {
+        type filter hook postrouting priority 300; policy accept;
+
+        oifname "fc-main" arp daddr ip 192.168.1.0/24 \
+            arp saddr ether set 02:01:00:00:00:fb \
+            ether saddr set 02:01:00:00:00:fb counter accept
+
+        oifname "fc-main" ether type arp drop
+
+        oifname "fc-main" ip daddr 192.168.1.0/24 \
+            ether saddr set 02:01:00:00:00:fb counter accept
+
+        oifname "fc-main" ip daddr != 192.168.0.0/21 \
+            ether saddr set 02:01:00:00:00:fb counter accept
+
+        oifname "fc-main" ether type ip drop
+NFT
+
+    for IDX in "${!SYN[@]}"; do
+        S="${SYN[$IDX]}"
+        R="${REAL[$IDX]}"
+        IF="${PORTS[$IDX]}"
+        MAC="${MACS[$IDX]}"
+
+        cat >>"$NFT" <<NFT
+        oifname "$IF" arp daddr ip 192.168.$S.0/24 \
+            arp daddr ip set arp daddr ip map @s${S}_to_${R} \
+            arp saddr ip set 192.168.$R.252 \
+            arp saddr ether set $MAC \
+            ether saddr set $MAC counter accept
+
+        oifname "$IF" ether type arp drop
+
+        oifname "$IF" ip daddr 192.168.$S.0/24 \
+            ip daddr set ip daddr map @s${S}_to_${R} \
+            ip saddr set 192.168.$R.252 \
+            ether saddr set $MAC counter accept
+
+        oifname "$IF" ether type ip drop
+NFT
+    done
+
+    echo '    }' >>"$NFT"
+    echo '}' >>"$NFT"
+
+    ip netns exec "$NS" nft -f "$NFT" || return 1
+    rm -f "$NFT"
+
+    return 0
+}
+
+case "$1" in
+    start)
+        start_net
+        ;;
+    stop)
+        ip netns del "$NS" 2>/dev/null || true
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
