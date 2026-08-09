@@ -1,0 +1,14 @@
+[Unit]
+Description=Fing Combined Multi-VLAN Network
+After=network-online.target
+Wants=network-online.target
+Before=snap.fing-agent.fingagent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/fing-combo-netns start
+ExecStop=/usr/local/sbin/fing-combo-netns stop
+
+[Install]
+WantedBy=multi-user.target
