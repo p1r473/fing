@@ -3,7 +3,7 @@
 NS="fing-combo"
 BR="fing0"
 
-BRMAC="02:ff:00:00:00:02"
+BRMAC="02:ff:00:00:00:03"
 MAINMAC="02:01:00:00:00:fb"
 
 SYN=(0 2 3 4 5 6)
@@ -63,9 +63,9 @@ add_port() {
     ip link add link "$PARENT" name "$IF" type macvlan mode bridge || return 1
     ip link set "$IF" netns "$NS" || return 1
 
-    ip -n "$NS" link set "$IF" address "$MAC"
-    ip -n "$NS" link set "$IF" master "$BR"
-    ip -n "$NS" link set "$IF" up
+    ip -n "$NS" link set "$IF" master "$BR" || return 1
+    ip -n "$NS" link set "$IF" address "$MAC" || return 1
+    ip -n "$NS" link set "$IF" up || return 1
 }
 
 make_map() {
@@ -112,6 +112,8 @@ start_net() {
             "${MACS[$IDX]}" || return 1
     done
 
+    ip -n "$NS" link set "$BR" address "$BRMAC"
+
     ip -n "$NS" addr add 192.168.1.251/21 dev "$BR"
     ip -n "$NS" route add default via 192.168.1.1 dev "$BR"
 
@@ -133,10 +135,10 @@ start_net() {
         type filter hook prerouting priority -300; policy accept;
 
         iifname "fc-main" arp daddr ether 02:01:00:00:00:fb \
-            arp daddr ether set 02:ff:00:00:00:02 counter
+            arp daddr ether set 02:ff:00:00:00:03 counter
 
         iifname "fc-main" ether daddr 02:01:00:00:00:fb \
-            ether daddr set 02:ff:00:00:00:02 counter
+            ether daddr set 02:ff:00:00:00:03 counter
 NFT
 
     for IDX in "${!SYN[@]}"; do
@@ -218,7 +220,9 @@ NFT
     echo '    }' >>"$NFT"
     echo '}' >>"$NFT"
 
+    ip netns exec "$NS" nft -c -f "$NFT" || return 1
     ip netns exec "$NS" nft -f "$NFT" || return 1
+
     rm -f "$NFT"
 
     return 0
